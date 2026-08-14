@@ -5,7 +5,7 @@ from .muon import Muon, get_muon_momentum, muon_update, zeropower_via_newtonschu
 import math
 
 def train_stage1(model, dataloader_train, dataset_training, device, prev_domain="start",
-                  max_epochs=5, lat_weights=None, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model"): #CHANGE MAX EPOCHS TO 30
+                  max_epochs=1, lat_weights=None, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model"): #CHANGE MAX EPOCHS TO 30
     """"
     Deterministic pre-training stage.
     Input is normalised, passed through model, weighted-mae is calculated
@@ -33,8 +33,7 @@ def train_stage1(model, dataloader_train, dataset_training, device, prev_domain=
     print(f"Y_MEAN={Y_MEAN:.4f}, Y_STD={Y_STD:.4f}", flush=True)
 
     # Optimizers
-    optimizers = build_optimizer(model, adamw_lr=3e-4, use_muon=use_muon,
-                                  muon_lr=0.003, muon_wd=0.03, muon_momentum=0.95)
+    optimizers = build_optimizer(model, adamw_lr=3e-4, use_muon=use_muon, muon_lr=0.003, muon_wd=0.03, muon_momentum=0.95)
     adamw_opt, muon_opt = optimizers["adamw"], optimizers["muon"]
 
     steps_per_epoch = len(dataloader_train)
@@ -102,7 +101,7 @@ def train_stage1(model, dataloader_train, dataset_training, device, prev_domain=
 
 def train_stage2(model, dataloader_train, dataset_training, device,
                         stage1_ckpt_path, lat_weights=None,
-                        max_epochs=5, early_stop_epoch=5, #CHANGE MAX EPOCHS TO 12
+                        max_epochs=1, early_stop_epoch=1, #CHANGE MAX EPOCHS TO 12
                         num_training_ensemble_members=2, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model", stochasticity="dropout"):
     """
     Probabilistic fine tuning. We now enable MC dropout and generate an ensemble for predictions.
@@ -141,16 +140,10 @@ def train_stage2(model, dataloader_train, dataset_training, device,
     mom_max = 0.95
     mom_min = mom_max - 0.1
     cooldown = WARMUP_STEPS // 10
-
     last_ckpt_path = None
-    global_step = 0
-    nan_grad_streak = 0
-    MAX_NAN_STREAK = 20
-    stop_training = False
+    global_step = 0   
     
     for epoch in range(early_stop_epoch): 
-        if stop_training:
-            break
         epoch_loss = 0
 
         for idx, (batch_x, batch_y) in enumerate(dataloader_train):
@@ -176,33 +169,14 @@ def train_stage2(model, dataloader_train, dataset_training, device,
             with torch.amp.autocast('cuda'):
                 # M stochastic forward passes. Use either dropout or perturbations
                 preds = torch.stack([model(batch_x, stochasticity) for _ in range(num_training_ensemble_members)], dim=0)  # (M, B, C, 128, 128)
-
                 loss_batch = fair_crps_loss(preds, batch_y_normed, lat_weights=None)
 
-            scaler.scale(loss_batch).backward()
-            scaler.unscale_(adamw_opt)
-            
-            if muon_opt is not None:
-                scaler.unscale_(muon_opt)
-                
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            scaler.step(adamw_opt)
-            if muon_opt is not None:
-                scaler.step(muon_opt)
-            scaler.update()
-
-            scheduler_adamw.step()
-            if scheduler_muon is not None:
-                scheduler_muon.step()
+            # Handle scaling issues with fp16
+            handle_fp16(scaler, loss_batch, model, adamw_opt, muon_opt, scheduler_adamw, scheduler_muon)
             ema.update(model)
 
             epoch_loss += batch_size * loss_batch.item()
             global_step += 1
-
-        if stop_training:
-            print(f"Stopping training early due to instability at epoch {epoch}, batch {idx}.")
-            break
 
         epoch_loss /= len(dataset_training)
         print(f"[Stage 2] Epoch {epoch+1}/{early_stop_epoch} (of {max_epochs} configured) - CRPS Loss: {epoch_loss:.6f}", flush=True)

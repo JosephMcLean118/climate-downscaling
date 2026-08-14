@@ -8,6 +8,19 @@ import math
 
 _silu = torch.nn.functional.silu
 
+def run_mosaic_attn(q, k, v, x, to_strategy, num_heads, tokens, rearrange_pattern):
+    sparse_block_size = min(16, tokens)
+    sparse_block_count = min(3, tokens // sparse_block_size)
+    block_size = choose_block(tokens, target_size=100)
+    strategy_logits = rearrange(to_strategy(x), rearrange_pattern, s=3, h=num_heads)
+    weights = torch.softmax(strategy_logits.float(), dim=0).type_as(x).unsqueezed(-1)
+
+    return mosaic_attn_func(
+        q=q, k=k, v=v, weight_ba_cmp_slc=weights,
+        block_attn_size=block_size, sparse_block_size=sparse_block_size,
+        sparse_block_count=sparse_block_count, block_attn_only=False
+    )
+
 class UNetBlock(nn.Module):
     def __init__(
         self,
@@ -35,8 +48,6 @@ class UNetBlock(nn.Module):
         self.num_heads = (
             0 if not attention else (num_heads if num_heads is not None else out_channels // channels_per_head)
         )
-        _silu = torch.nn.functional.silu
-        
 
         self.norm0 = GroupNorm(num_channels=in_channels, eps=eps)
         self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=3, up=up, down=down)
@@ -75,9 +86,6 @@ class UNetBlock(nn.Module):
         if self.num_heads:
             b, c, h, w = x.shape
             tokens = h*w
-            sparse_block_size = min(16, tokens)
-            nb = tokens // sparse_block_size
-            effective_sparse_block_count = min(3, nb) #1
             nh = self.num_heads
             B2, C2 = b * nh, c // nh
             normed = self.norm2(x)
@@ -87,17 +95,8 @@ class UNetBlock(nn.Module):
                 # Rearrange tensors
                 block_size = choose_block_size(tokens, target_size=100)
                 q, k, v = [rearrange(x, "(b h) d t -> b t h d", b=b, h=nh) for x in (q, k, v)]
-                strategy_logits = self.to_strategy(normed)                         # (b, 3*nh, h, w)
-                strategy_logits = rearrange(strategy_logits, "b (s nh) h w -> s b (h w) nh", s=3, nh=nh)
-                weight_ba_cmp_slc = torch.softmax(strategy_logits.float(), dim=0).type_as(x).unsqueeze(-1)
-                a = mosaic_attn_func(
-                        q=q, k=k, v=v,
-                        weight_ba_cmp_slc=weight_ba_cmp_slc,
-                        block_attn_size = block_size,        # for block_attention
-                        sparse_block_size = sparse_block_size,   # smaller target, for compression/selection
-                        sparse_block_count = effective_sparse_block_count,
-                        block_attn_only=False,
-                    )
+                a = run_mosaic_attn(q=q, k=k, v=v, to_strategy=to_strategy, num_heads=nh, 
+                                tokens=tokens, strategy_pattern="b (s hh) H W -> s b (H W) hh")
                 
                 a = rearrange(a, "b (h w) nh c -> b (nh c) h w", h=h, w=w)
             else:
@@ -108,6 +107,131 @@ class UNetBlock(nn.Module):
             x = self.proj(a).add_(x)
             
         return x
+
+
+
+# Transformer architecture
+
+class TransformerUNetBlock(nn.Module):
+    """
+    Transormer style block to be used in UNet in place of convolutional style blocks.
+    
+    Rather than have attention at certain layers and use convolutions for feature
+    extraction and resampling, use self attention at all layers and MLP based feature
+    processing,
+    """
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        up=False,
+        down=False,
+        num_heads=None,
+        dropout=0.1,
+        mlp_ratio=4.0,
+        eps=1e-5,
+    ):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.up = up
+        self.down = down
+        self.noise_dim=64
+        self.swiglu = cSwiGLU(
+            dim=out_channels,
+            hidden_dim=out_channels * 4,
+            noise_dim=self.noise_dim,
+        
+        )
+
+        # Spatial resampling
+        self.upsample = (nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False) if up else None)
+        self.downsample = (nn.AvgPool2d(kernel_size=2,stride=2)if down else None)
+        
+        self.input_proj = nn.Linear(in_channels, out_channels)
+
+        if in_channels != out_channels:
+            self.skip_proj = nn.Linear(in_channels, out_channels)
+        else:
+            self.skip_proj = nn.Identity()
+
+
+        self.num_heads = (num_heads if num_heads is not None else max(1, out_channels // 64))
+        self.to_strategy = nn.Linear(out_channels,3 * self.num_heads)
+
+        assert out_channels % self.num_heads == 0
+
+        self.norm1 = nn.LayerNorm(out_channels, eps=eps)
+        self.qkv = nn.Linear(out_channels, out_channels * 3)
+        self.proj = nn.Linear(out_channels,out_channels)
+
+        # MLP
+        self.norm2 = nn.LayerNorm(out_channels, eps=eps)
+
+        hidden_channels = int(out_channels * mlp_ratio)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(out_channels, hidden_channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, out_channels),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x, z=None):
+        
+        # x: [B, Cin, H, W]
+        residual = x
+        nh = self.num_heads
+        
+        # Resampling
+        if self.up:
+            x = self.upsample(x)
+            residual = self.upsample(residual)
+    
+        if self.down:
+            x = self.downsample(x)
+            residual = self.downsample(residual)
+
+        B, C, H, W = x.shape
+        tokens = H * W
+
+        # Image to tokens
+        x = rearrange(x, "b c h w -> b (h w) c")
+        residual = rearrange(residual, "b c h w -> b (h w) c")
+        nb = tokens // sparse_block_size
+
+        # Input projection
+        x = self.input_proj(x)
+
+        # Residual projection
+        residual = self.skip_proj(residual)
+
+        # Self attention
+        x_norm = self.norm1(x)
+        qkv = self.qkv(x_norm)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = rearrange(q, "b n (h d) -> b n h d", h=nh)
+        k = rearrange(k, "b n (h d) -> b n h d", h=nh)
+        v = rearrange(v, "b n (h d) -> b n h d", h=nh)
+
+        # Block Sparse Attention
+        out = run_mosaic_attn(q=q, k=k, v=v, x=x_norm, to_strategy=self.to_strategy, num_heads=nh, 
+                    tokens=tokens, strategy_pattern="b (s h) hh ww -> s b (hh ww) h")
+
+        # Heads to channels
+        out = rearrange(out, "b n h d -> b n (h d)")
+        out = self.proj(out)
+
+        # Attention residual
+        x = residual + out
+
+        # MLP residual
+        x = x + self.swiglu(self.norm2(x), z)
+        x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W)
+
+        return x   
 
 
 class DhariwalUNet(nn.Module):
@@ -268,165 +392,4 @@ class DhariwalUNet(nn.Module):
                 x = block(x)
 
         x = self.out_conv(_silu(self.out_norm(x)))
-        return x
-
-
-
-        
-
-# Transformer architecture
-
-class TransformerUNetBlock(nn.Module):
-    """
-    Transormer style block to be used in UNet in place of convolutional style blocks.
-    
-    Rather than have attention at certain layers and use convolutions for feature
-    extraction and resampling, use self attention at all layers and MLP based feature
-    processing,
-    """
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        up=False,
-        down=False,
-        num_heads=None,
-        dropout=0.1,
-        mlp_ratio=4.0,
-        eps=1e-5,
-    ):
-        super().__init__()
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.up = up
-        self.down = down
-        self.noise_dim=64
-        self.swiglu = cSwiGLU(
-            dim=out_channels,
-            hidden_dim=out_channels * 4,
-            noise_dim=self.noise_dim,
-        
-        )
-
-        # Spatial resampling
-        self.upsample = (
-            nn.Upsample(
-                scale_factor=2,
-                mode="bilinear",
-                align_corners=False
-            )
-            if up else None
-        )
-
-        self.downsample = (
-            nn.AvgPool2d(
-                kernel_size=2,
-                stride=2
-            )
-            if down else None
-        )
-        self.input_proj = nn.Linear(
-            in_channels,
-            out_channels
-        )
-
-        if in_channels != out_channels:
-            self.skip_proj = nn.Linear(
-                in_channels,
-                out_channels
-            )
-        else:
-            self.skip_proj = nn.Identity()
-
-
-        self.num_heads = (num_heads if num_heads is not None else max(1, out_channels // 64))
-        self.to_strategy = nn.Linear(out_channels,3 * self.num_heads)
-
-        assert out_channels % self.num_heads == 0
-
-        self.norm1 = nn.LayerNorm(out_channels, eps=eps)
-        self.qkv = nn.Linear(out_channels, out_channels * 3)
-        self.proj = nn.Linear(out_channels,out_channels)
-        #self.attn_dropout = nn.Dropout(dropout)
-
-        # MLP
-        self.norm2 = nn.LayerNorm(out_channels, eps=eps)
-
-        hidden_channels = int(out_channels * mlp_ratio)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(out_channels, hidden_channels),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_channels, out_channels),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x, z=None):
-        
-        # x: [B, Cin, H, W]
-        residual = x
-        nh = self.num_heads
-        
-
-        # Resampling
-        if self.up:
-            x = self.upsample(x)
-            residual = self.upsample(residual)
-    
-        if self.down:
-            x = self.downsample(x)
-            residual = self.downsample(residual)
-
-        B, C, H, W = x.shape
-        tokens = H * W
-
-        # Image to tokens
-        x = rearrange(x, "b c h w -> b (h w) c")
-
-        residual = rearrange(residual, "b c h w -> b (h w) c")
-        sparse_block_size = min(16, tokens)
-        nb = tokens // sparse_block_size
-        effective_sparse_block_count = min(3, nb)
-
-        # Input projection
-        x = self.input_proj(x)
-
-        # Residual projection
-        residual = self.skip_proj(residual)
-
-        # Self attention
-        x_norm = self.norm1(x)
-        qkv = self.qkv(x_norm)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = rearrange(q, "b n (h d) -> b n h d", h=nh)
-        k = rearrange(k, "b n (h d) -> b n h d", h=nh)
-        v = rearrange(v, "b n (h d) -> b n h d", h=nh)
-
-        # Block Sparse Attention
-        block_size = choose_block_size(tokens, target_size=100)
-        strategy_logits = self.to_strategy(x)                         
-        strategy_logits = rearrange(strategy_logits, "b n (s h)  -> s b n h", s=3, h=nh)
-        weight_ba_cmp_slc = torch.softmax(strategy_logits.float(), dim=0).type_as(x).unsqueeze(-1)
-        out = mosaic_attn_func(
-            q=q, k=k, v=v,
-            weight_ba_cmp_slc=weight_ba_cmp_slc,
-            block_attn_size = block_size,        # for block_attention
-            sparse_block_size = sparse_block_size,   # smaller target, for compression/selection
-            sparse_block_count = effective_sparse_block_count,
-            block_attn_only=False,
-        )
-
-        # Heads to channels
-        out = rearrange(out, "b n h d -> b n (h d)")
-        out = self.proj(out)
-
-        # Attention residual
-        x = residual + out
-
-        # MLP residual
-        x = x + self.swiglu(self.norm2(x), z)
-        x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W)
-
         return x
