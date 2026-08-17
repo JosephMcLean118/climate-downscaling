@@ -12,7 +12,7 @@ def run_mosaic_attn(q, k, v, x, to_strategy, num_heads, tokens, rearrange_patter
     sparse_block_size = min(16, tokens)
     sparse_block_count = min(3, tokens // sparse_block_size)
     block_size = choose_block_size(tokens, target_size=100)
-    strategy_logits = rearrange(to_strategy(x), rearrange_pattern, s=3, hh=num_heads)
+    strategy_logits = rearrange(to_strategy(x), rearrange_pattern, s=3, h=num_heads)
     weights = torch.softmax(strategy_logits.float(), dim=0).type_as(x).unsqueeze(-1)
 
     return mosaic_attn_func(
@@ -96,7 +96,7 @@ class UNetBlock(nn.Module):
                 block_size = choose_block_size(tokens, target_size=100)
                 q, k, v = [rearrange(x, "(b h) d t -> b t h d", b=b, h=nh) for x in (q, k, v)]
                 a = run_mosaic_attn(q=q, k=k, v=v, x=x, to_strategy=self.to_strategy, num_heads=nh, 
-                                tokens=tokens, rearrange_pattern="b (s hh) H W -> s b (H W) hh")
+                                tokens=tokens, rearrange_pattern="b (s h) H W -> s b (H W) h")
                 a = rearrange(a, "b (h w) nh c -> b (nh c) h w", h=h, w=w)
             else:
                 # Dense attention
@@ -116,7 +116,7 @@ class TransformerUNetBlock(nn.Module):
     
     Rather than have attention at certain layers and use convolutions for feature
     extraction and resampling, use self attention at all layers and MLP based feature
-    processing,
+    processing.
     """
     def __init__(
         self,
@@ -195,6 +195,7 @@ class TransformerUNetBlock(nn.Module):
         # Image to tokens
         x = rearrange(x, "b c h w -> b (h w) c")
         residual = rearrange(residual, "b c h w -> b (h w) c")
+        sparse_block_size = min(16, tokens)
         nb = tokens // sparse_block_size
 
         # Input projection
@@ -213,7 +214,7 @@ class TransformerUNetBlock(nn.Module):
 
         # Block Sparse Attention
         out = run_mosaic_attn(q=q, k=k, v=v, x=x_norm, to_strategy=self.to_strategy, num_heads=nh, 
-                    tokens=tokens, strategy_pattern="b (s h) hh ww -> s b (hh ww) h")
+                    tokens=tokens, rearrange_pattern="b n (s h) -> s b n h")
 
         # Heads to channels
         out = rearrange(out, "b n h d -> b n (h d)")
