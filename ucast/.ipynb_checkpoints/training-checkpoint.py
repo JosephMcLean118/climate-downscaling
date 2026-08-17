@@ -5,7 +5,7 @@ from .muon import Muon, get_muon_momentum, muon_update, zeropower_via_newtonschu
 import math
 
 def train_stage1(model, dataloader_train, dataset_training, device, prev_domain="start",
-                  max_epochs=1, lat_weights=None, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model"): #CHANGE MAX EPOCHS TO 30
+                  max_epochs=3, lat_weights=None, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model"): #CHANGE MAX EPOCHS TO 30
     """"
     Deterministic pre-training stage.
     Input is normalised, passed through model, weighted-mae is calculated
@@ -101,7 +101,7 @@ def train_stage1(model, dataloader_train, dataset_training, device, prev_domain=
 
 def train_stage2(model, dataloader_train, dataset_training, device,
                         stage1_ckpt_path, lat_weights=None,
-                        max_epochs=1, early_stop_epoch=1, #CHANGE MAX EPOCHS TO 12
+                        max_epochs=3, early_stop_epoch=3, 
                         num_training_ensemble_members=2, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model", stochasticity="dropout"):
     """
     Probabilistic fine tuning. We now enable MC dropout and generate an ensemble for predictions.
@@ -129,7 +129,9 @@ def train_stage2(model, dataloader_train, dataset_training, device,
     
     steps_per_epoch = len(dataloader_train)
     total_steps = max_epochs * steps_per_epoch  
-    WARMUP_STEPS = 1500
+
+    # Warmup steps to total steps ratio was 0.09375
+    WARMUP_STEPS = total_steps * 0.09375
 
     scheduler_adamw = LinearWarmupCosineAnnealingLR(adamw_opt, warmup_steps=WARMUP_STEPS, max_steps=total_steps, warmup_start_lr=1e-8, eta_min=1e-8)
     scheduler_muon = LinearWarmupCosineAnnealingLR(muon_opt, warmup_steps=WARMUP_STEPS, max_steps=total_steps, warmup_start_lr=1e-8, eta_min=1e-8) if muon_opt else None
