@@ -5,7 +5,7 @@ from .muon import Muon, get_muon_momentum, muon_update, zeropower_via_newtonschu
 import math
 
 def train_stage1(model, dataloader_train, dataset_training, device, prev_domain="start",
-                  max_epochs=3, lat_weights=None, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model"): #CHANGE MAX EPOCHS TO 30
+                  max_epochs=8, lat_weights=None, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model"): #CHANGE MAX EPOCHS TO 30
     """"
     Deterministic pre-training stage.
     Input is normalised, passed through model, weighted-mae is calculated
@@ -101,7 +101,7 @@ def train_stage1(model, dataloader_train, dataset_training, device, prev_domain=
 
 def train_stage2(model, dataloader_train, dataset_training, device,
                         stage1_ckpt_path, lat_weights=None,
-                        max_epochs=3, early_stop_epoch=3, 
+                        max_epochs=8, early_stop_epoch=8, 
                         num_training_ensemble_members=2, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model", stochasticity="dropout"):
     """
     Probabilistic fine tuning. We now enable MC dropout and generate an ensemble for predictions.
@@ -172,6 +172,13 @@ def train_stage2(model, dataloader_train, dataset_training, device,
                 # M stochastic forward passes. Use either dropout or perturbations
                 preds = torch.stack([model(batch_x, stochasticity) for _ in range(num_training_ensemble_members)], dim=0)  # (M, B, C, 128, 128)
                 loss_batch = fair_crps_loss(preds, batch_y_normed, lat_weights=None)
+
+            if torch.isnan(loss_batch) or torch.isinf(loss_batch):
+                print(f"epoch {epoch}, batch {idx}: BAD loss")
+                # dump grad norms of key params to see if it's exploding gradients, not activations
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+                print(f"grad norm at failure: {total_norm}")
+                break
 
             # Handle scaling issues with fp16
             handle_fp16(scaler, loss_batch, model, adamw_opt, muon_opt, scheduler_adamw, scheduler_muon)

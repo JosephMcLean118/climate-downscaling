@@ -11,9 +11,9 @@ _silu = torch.nn.functional.silu
 def run_mosaic_attn(q, k, v, x, to_strategy, num_heads, tokens, rearrange_pattern):
     sparse_block_size = min(16, tokens)
     sparse_block_count = min(3, tokens // sparse_block_size)
-    block_size = choose_block(tokens, target_size=100)
-    strategy_logits = rearrange(to_strategy(x), rearrange_pattern, s=3, h=num_heads)
-    weights = torch.softmax(strategy_logits.float(), dim=0).type_as(x).unsqueezed(-1)
+    block_size = choose_block_size(tokens, target_size=100)
+    strategy_logits = rearrange(to_strategy(x), rearrange_pattern, s=3, hh=num_heads)
+    weights = torch.softmax(strategy_logits.float(), dim=0).type_as(x).unsqueeze(-1)
 
     return mosaic_attn_func(
         q=q, k=k, v=v, weight_ba_cmp_slc=weights,
@@ -74,13 +74,13 @@ class UNetBlock(nn.Module):
         x = _silu(self.norm1(x))
         x = self.conv1(self.dropout(x))
         x = x.add_(self.skip(orig) if self.skip is not None else orig)
-
-        # Learned functional perturbation
-        if z is not None:
+        
+        # Functional perturbation
+        if z is not None and x.shape[-1] < 128:
             b, c, h, w = x.shape
             tokens_x = rearrange(x,"b c h w -> b (h w) c")
-            tokens_x = tokens_x + self.swiglu(tokens_x,z)
-    
+            swiglu_out = self.swiglu(tokens_x,z)
+            tokens_x = tokens_x + swiglu_out
             x = rearrange(tokens_x,"b (h w) c -> b c h w",h=h,w=w)
 
         if self.num_heads:
@@ -95,9 +95,8 @@ class UNetBlock(nn.Module):
                 # Rearrange tensors
                 block_size = choose_block_size(tokens, target_size=100)
                 q, k, v = [rearrange(x, "(b h) d t -> b t h d", b=b, h=nh) for x in (q, k, v)]
-                a = run_mosaic_attn(q=q, k=k, v=v, to_strategy=to_strategy, num_heads=nh, 
-                                tokens=tokens, strategy_pattern="b (s hh) H W -> s b (H W) hh")
-                
+                a = run_mosaic_attn(q=q, k=k, v=v, x=x, to_strategy=self.to_strategy, num_heads=nh, 
+                                tokens=tokens, rearrange_pattern="b (s hh) H W -> s b (H W) hh")
                 a = rearrange(a, "b (h w) nh c -> b (nh c) h w", h=h, w=w)
             else:
                 # Dense attention
@@ -107,7 +106,6 @@ class UNetBlock(nn.Module):
             x = self.proj(a).add_(x)
             
         return x
-
 
 
 # Transformer architecture
@@ -156,7 +154,6 @@ class TransformerUNetBlock(nn.Module):
         else:
             self.skip_proj = nn.Identity()
 
-
         self.num_heads = (num_heads if num_heads is not None else max(1, out_channels // 64))
         self.to_strategy = nn.Linear(out_channels,3 * self.num_heads)
 
@@ -180,8 +177,6 @@ class TransformerUNetBlock(nn.Module):
         )
 
     def forward(self, x, z=None):
-        
-        # x: [B, Cin, H, W]
         residual = x
         nh = self.num_heads
         
@@ -354,7 +349,6 @@ class DhariwalUNet(nn.Module):
             parts.append(static_condition)
         x = torch.cat(parts, dim=1) if len(parts) > 1 else inputs
 
-    
         if stochasticity == "perturbation":
             z = torch.randn(x.shape[0], self.noise_dim, device=x.device, dtype=x.dtype)
         else:

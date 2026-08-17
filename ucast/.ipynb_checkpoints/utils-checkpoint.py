@@ -933,11 +933,24 @@ class cSwiGLU(nn.Module):
         self.w13 = nn.Linear(dim, 2 * hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.act_fn = nn.SiLU()
+        self.norm = nn.LayerNorm(dim)
+        self.perturb_scale = 0.1
 
         if noise_dim > 0:
             self.noise_bias = nn.Linear(noise_dim, hidden_dim, bias=False)
 
+        with torch.no_grad():
+            self.w2.weight.mul_(0.1)
+            if noise_dim > 0:
+                self.noise_bias.weight.mul_(0.1)
+
+
     def forward(self, x: torch.Tensor, z: torch.Tensor = None):
         noise = self.noise_bias(z).unsqueeze(1) if z is not None else 0
+    
         x1, x3 = self.w13(x).chunk(2, dim=-1)
-        return self.w2(self.act_fn(x1 + noise) * x3)
+        out = self.w2(self.act_fn(x1 + noise) * x3)
+        out = self.norm(out)
+        out = self.perturb_scale * out
+        
+        return out
