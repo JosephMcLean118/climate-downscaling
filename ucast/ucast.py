@@ -224,7 +224,7 @@ class TransformerUNetBlock(nn.Module):
         x = residual + out
 
         # MLP residual
-        x = x + self.swiglu(self.norm2(x), z)
+        x = x + self.mlp(x)
         x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W)
 
         return x   

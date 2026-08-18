@@ -1,2 +1,0 @@
-model,domain,stochasticity,attention,RMSE,Mean_Bias,P98_Bias,RALSD
-ucast_cnn_mcdropout,SA,dropout,dense,1.7498600482940674,0.524278998374939,-0.0556986368820063,52.26717509573733

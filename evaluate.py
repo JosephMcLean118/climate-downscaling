@@ -87,16 +87,17 @@ def evaluate_model(model: nn.Module, state_path: str, var_target: str, training_
     """
 
     if domain == "ALL":
-        print("ALL")
         data_all_domains = {domain: prepare_data(domain, training_experiment, var_target) for domain in ["NZ", "SA", "ALPS"]}
     else:
         data_all_domains = {domain: prepare_data(domain, training_experiment, var_target) for domain in [domain]}
     
     directory_name = "results"
-    csv_rows = []
+    cordex_rows = []
+    model_rows = []
     
     for domain, data in data_all_domains.items():
         # Generate models predictions on test dataset
+        torch.cuda.reset_peak_memory_stats()
         if is_probabilistic:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
             
@@ -111,8 +112,6 @@ def evaluate_model(model: nn.Module, state_path: str, var_target: str, training_
             y_test = data["y_test"]
             y_test_stack = data["y_test_stack"]
             x_test_stand_array = data["x_test_stand_array"]
-            dataset_training = data["dataset_training"]
-            dataloader_train = data["dataloader_train"]
             test_dataloader = data["test_dataloader"]
         
             model.eval()
@@ -121,7 +120,7 @@ def evaluate_model(model: nn.Module, state_path: str, var_target: str, training_
             enable_inference_dropout(model)  
         
             N_ENSEMBLE_MEMBERS = 10  
-            all_member_predictions = [] # (n_samples, C, 128, 128)
+            all_member_predictions = []
         
             with torch.no_grad():
                 for member_idx in range(N_ENSEMBLE_MEMBERS):
@@ -135,7 +134,7 @@ def evaluate_model(model: nn.Module, state_path: str, var_target: str, training_
                     member_predictions = np.concatenate(member_predictions, axis=0)  
                     all_member_predictions.append(member_predictions)
         
-            all_member_predictions = np.stack(all_member_predictions, axis=0)  # (N_ENSEMBLE_MEMBERS, n_samples, C, 128, 128)
+            all_member_predictions = np.stack(all_member_predictions, axis=0)  
         
             # Ensemble mean
             predictions = all_member_predictions.mean(axis=0)  
@@ -163,6 +162,7 @@ def evaluate_model(model: nn.Module, state_path: str, var_target: str, training_
     
         rmse = diagnostics.rmse(x0=y_test, x1=y_pred, var=var_target, dim='time')
         mean_rmse = rmse[var_target].mean().values.item()
+        num_params = sum(p.numel() for p in model.parameters())
     
         #bias_index = diagnostics.bias_index(x0=y_test, x1=y_pred,var=var_target)
         bias_mean = diagnostics.bias_index(x0=y_test, x1=y_pred,index_fn=indices.mean,var=var_target)
@@ -176,26 +176,37 @@ def evaluate_model(model: nn.Module, state_path: str, var_target: str, training_
         psd_difference = psd_target - psd_pred
         
         ralsd = diagnostics.ralsd(psd_target, psd_pred)
+        txx = indices.txx(x=y_pred, var=var_target)
+        mean_txx = txx["tasmax"].mean(dim=("lat", "lon")).item()
+        iav = (indices.interannual_var(x=y_pred, var=var_target))["tasmax"].mean(dim=("lat", "lon")).item()
+        pss = indices.pss(x0=y_test, x1=y_pred, var=var_target)
         #wasserstein_difference = diagnostics.wasserstein_differnce()
+        peak_mb = torch.cuda.max_memory_allocated() / 1024**3
 
         try:
             ralsd_value = float(ralsd)
         except:
             ralsd_value = float(np.asarray(ralsd).mean())
         
-        csv_rows.append({
+        cordex_rows.append({
             "model": model_name,
             "domain": domain,
-            "stochasticity": (
-                stochasticity if is_probabilistic else "deterministic"
-            ),
+            "paramaters": num_params,
+            "stochasticity": (stochasticity if is_probabilistic else "deterministic"),
             "attention" : attention,
-            "RMSE": mean_rmse,
-            "Mean_Bias": float(bias_mean[var_target].mean().values),
-            "P98_Bias": float(bias_p98[var_target].mean().values),
-            "RALSD": ralsd_value,
+            "RMSE": round(mean_rmse, 4),
+            "TXx": round(mean_txx, 4),
+            "RALSD": round(ralsd_value, 4),
+            "PSS": round(pss, 4),
+            "IAV": round(iav, 4),
+            "Inference Memory Usage (GB)": peak_mb,
+            "Mean_Bias": round(float(bias_mean[var_target].mean().values), 4),
+            "P98_Bias": round(float(bias_p98[var_target].mean().values), 4)
         })
 
+
+
+        
         try:
             os.mkdir(f"results/{model_name}/{domain}")
             os.mkdir(f"results/{model_name}/{domain}/data")
@@ -215,7 +226,9 @@ def evaluate_model(model: nn.Module, state_path: str, var_target: str, training_
 
     print(f"RMSE: {mean_rmse}")
     csv_path = f"results/model_performance.csv"
-    new_results = pd.DataFrame(csv_rows)
+    new_results = pd.DataFrame(cordex_rows)
+
+    
     
     if os.path.exists(csv_path):
         old_results = pd.read_csv(csv_path)

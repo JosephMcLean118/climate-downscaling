@@ -359,3 +359,55 @@ def interannual_var(x: xr.Dataset, var: str, season: str | None = None) -> xr.Da
     x = _filter_by_season(x, season)
     da = x[[var]]
     return da.groupby('time.year').mean(dim='time').std('year')
+
+def pss(x0, x1, var, bins=None):
+    """
+    Perkins Skill Score.
+
+    Measures the overlap between the PDFs of two distributions.
+
+    Parameters
+    ----------
+    x0 : xr.Dataset
+        Reference/observed data.
+    x1 : xr.Dataset
+        Modelled data.
+    var : str
+        Variable name, e.g. "tasmax".
+    bins : array-like, optional
+        Histogram bin edges. If None, 0.5 degree bins are used.
+
+    Returns
+    -------
+    float
+        Perkins Skill Score, between 0 and 1.
+    """
+
+    obs = x0[var].values.ravel()
+    pred = x1[var].values.ravel()
+
+
+    obs = obs[np.isfinite(obs)]
+    pred = pred[np.isfinite(pred)]
+
+    if bins is None:
+        data_min = min(obs.min(), pred.min())
+        data_max = max(obs.max(), pred.max())
+
+        bins = np.arange(
+            np.floor(data_min * 2) / 2,
+            np.ceil(data_max * 2) / 2 + 0.5,
+            0.5
+        )
+
+    # Probability histograms
+    obs_pdf, _ = np.histogram(obs, bins=bins, density=True)
+    pred_pdf, _ = np.histogram(pred, bins=bins, density=True)
+
+    # Bin widths
+    bin_widths = np.diff(bins)
+
+    # Integral of the minimum of the two PDFs
+    score = np.sum(np.minimum(obs_pdf, pred_pdf) * bin_widths)
+
+    return float(score)

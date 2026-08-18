@@ -1,3 +1,2 @@
-model,domain,stochasticity,attention,RMSE,Mean_Bias,P98_Bias,RALSD
-ucast_cnn_mcdropout,SA,dropout,dense,1.7498600482940674,0.524278998374939,-0.0556986368820063,52.26717509573733
-ucast_cnn_mcdropout,SA,dropout,dense,1.278730869293213,0.14717362821102142,-0.20744690120220127,2.8229796935885014
+model,domain,paramaters,stochasticity,attention,RMSE,TXx,RALSD,PSS,IAV,Inference Memory Usage,Mean_Bias,P98_Bias
+ucast_convolutional_mcdropout,SA,180829247,dropout,dense,1.2781,308.0837,2.9539,0.9852,0.6242,2104.40185546875,0.1468,-0.271

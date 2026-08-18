@@ -213,7 +213,10 @@ def train(model: nn.Module, var_target="tasmax", training_experiment='ESD_pseudo
         os.mkdir(f"models/{model_name}")
     except FileExistsError:
         print("A model with this name already exists")
+        
     is_first=True
+    torch.cuda.reset_peak_memory_stats()
+    
     for domain, data in data_all_domains.items():
         os.mkdir(f"models/{model_name}/{domain}")
         device = ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -244,3 +247,4 @@ def train(model: nn.Module, var_target="tasmax", training_experiment='ESD_pseudo
             )
         os.makedirs(f"results/{model_name}/training", exist_ok=True)
         plot_training_history(stage1_history, stage2_history, model_name=model_name, domain=domain)
+        

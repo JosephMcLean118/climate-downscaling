@@ -5,7 +5,7 @@ from .muon import Muon, get_muon_momentum, muon_update, zeropower_via_newtonschu
 import math
 
 def train_stage1(model, dataloader_train, dataset_training, device, prev_domain="start",
-                  max_epochs=8, lat_weights=None, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model"): #CHANGE MAX EPOCHS TO 30
+                  max_epochs=100, lat_weights=None, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model"): 
     """"
     Deterministic pre-training stage.
     Input is normalised, passed through model, weighted-mae is calculated
