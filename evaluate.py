@@ -199,7 +199,7 @@ def evaluate_model(model: nn.Module, state_path: str, var_target: str, training_
             "RALSD": round(ralsd_value, 4),
             "PSS": round(pss, 4),
             "IAV": round(iav, 4),
-            "Inference Memory Usage (GB)": peak_mb,
+            "Inference Memory Usage (GB)": round(peak_mb, 4),
             "Mean_Bias": round(float(bias_mean[var_target].mean().values), 4),
             "P98_Bias": round(float(bias_p98[var_target].mean().values), 4)
         })

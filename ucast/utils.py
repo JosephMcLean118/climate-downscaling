@@ -474,7 +474,7 @@ def compute_area_weights(latitudes: torch.Tensor) -> torch.Tensor:
     w = torch.cos(torch.deg2rad(latitudes))
     return w / w.mean()
 
-def weighted_mae_loss(pred, target, lat_weights):
+def weighted_mae_loss(pred, target, lat_weights=None):
     err = (pred - target).abs()
     if lat_weights is None:
         return err.mean()
@@ -498,9 +498,9 @@ class EMA:
         model.load_state_dict(self.shadow, strict=True)
 
 
-def build_optimizer(model, adamw_lr, use_muon=False, muon_lr=0.003, muon_wd=0.03, muon_momentum=0.95 ):
+def build_optimizer(model, adamw_lr, adamw_wd, use_muon=False, muon_lr=0.003, muon_wd=0.03, muon_momentum=0.95 ):
     if not use_muon:
-        return torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1,
+        return torch.optim.AdamW(model.parameters(), lr=adamw_lr, weight_decay=adamw_wd,
                                   eps=1e-8, betas=(0.9, 0.95))
     else:
         muon_params = []
@@ -514,7 +514,7 @@ def build_optimizer(model, adamw_lr, use_muon=False, muon_lr=0.003, muon_wd=0.03
             ):
                 muon_params.append(p)
         return {"muon": Muon(muon_params, muon_lr, muon_wd, muon_momentum),
-               "adamw": torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1,
+               "adamw": torch.optim.AdamW(model.parameters(), lr=adamw_lr, weight_decay=adamw_wd,
                                   eps=1e-8, betas=(0.9, 0.95))}
     
 class LinearWarmupCosineAnnealingLR(torch.optim.lr_scheduler._LRScheduler):
@@ -541,13 +541,13 @@ def fair_crps_loss(preds, target, lat_weights=None):
     target: (B, C, H, W)
     """
     M = preds.shape[0]
-    term1 = (preds - target.unsqueeze(0)).abs().mean(dim=0) 
+    skill = (preds - target.unsqueeze(0)).abs().mean(dim=0) 
     if M > 1:
         diff = preds.unsqueeze(0) - preds.unsqueeze(1)  
-        term2 = diff.abs().sum(dim=(0, 1)) / (M * (M - 1))
+        spread = diff.abs().sum(dim=(0, 1)) / (M * (M - 1))
     else:
-        term2 = torch.zeros_like(term1)
-    crps = term1 - 0.5 * term2  
+        term2 = torch.zeros_like(skill)
+    crps = skill - 0.5 * spread  
     if lat_weights is not None:
         crps = crps * lat_weights.view(1, 1, -1, 1)
     return crps.mean()
@@ -557,6 +557,13 @@ def enable_inference_dropout(model):
     for m in model.modules():
         if isinstance(m, nn.Dropout):
             m.train()
+            
+def disable_inference_dropout(model):
+    """Keep dropout layers deterministic (disabled), even if the rest of the model is in eval/train mode."""
+    for m in model.modules():
+        if isinstance(m, nn.Dropout):
+            m.eval()
+
 
 def handle_fp16(scaler, loss_batch, model, adamw_opt, muon_opt, scheduler_adamw, scheduler_muon):
     """

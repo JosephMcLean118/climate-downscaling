@@ -39,12 +39,7 @@ class UNetBlock(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.noise_dim=64
-        self.swiglu = cSwiGLU(
-            dim=out_channels,
-            hidden_dim=out_channels * 4,
-            noise_dim=self.noise_dim,
-        
-        )
+        self.swiglu = cSwiGLU(dim=out_channels, hidden_dim=out_channels * 4, noise_dim=self.noise_dim)
         self.num_heads = (
             0 if not attention else (num_heads if num_heads is not None else out_channels // channels_per_head)
         )
@@ -75,7 +70,7 @@ class UNetBlock(nn.Module):
         x = self.conv1(self.dropout(x))
         x = x.add_(self.skip(orig) if self.skip is not None else orig)
         
-        # Functional perturbation
+        # Functional perturbation avoiding high resolution (128x128) layer
         if z is not None and x.shape[-1] < 128:
             b, c, h, w = x.shape
             tokens_x = rearrange(x,"b c h w -> b (h w) c")
@@ -93,7 +88,6 @@ class UNetBlock(nn.Module):
 
             if self.block_sparse_attention and tokens>=16:
                 # Rearrange tensors
-                block_size = choose_block_size(tokens, target_size=100)
                 q, k, v = [rearrange(x, "(b h) d t -> b t h d", b=b, h=nh) for x in (q, k, v)]
                 a = run_mosaic_attn(q=q, k=k, v=v, x=x, to_strategy=self.to_strategy, num_heads=nh, 
                                 tokens=tokens, rearrange_pattern="b (s h) H W -> s b (H W) h")
@@ -224,7 +218,7 @@ class TransformerUNetBlock(nn.Module):
         x = residual + out
 
         # MLP residual
-        x = x + self.mlp(x)
+        x = x + self.mlp(self.norm2(x))
         x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W)
 
         return x   
@@ -238,7 +232,7 @@ class DhariwalUNet(nn.Module):
         self,
         in_channels,
         out_channels,
-        model_channels=128,
+        model_channels=64,
         channel_mult=(1, 2, 3, 4),
         num_blocks=3,
         attn_levels=(2, 3),

@@ -3,7 +3,7 @@ import xarray as xr
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from ucast.utils import enable_inference_dropout 
+from ucast.utils import enable_inference_dropout, compute_area_weights 
 import torch.nn as nn
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -140,10 +140,16 @@ def prepare_data(domain="NZ", training_experiment="ESD_pseudo_reality", var_targ
    
     predictor_filename = f'.{DATA_PATH}/{domain}/{domain}_domain/train/{training_experiment}/predictors/{gcm_name}_{period_training}.nc'
     predictor = xr.open_dataset(predictor_filename)
+
+    device = ('cuda' if torch.cuda.is_available() else 'cpu')
+        
+
     
     
     predictand_filename = f'.{DATA_PATH}/{domain}/{domain}_domain/train/{training_experiment}/target/pr_tasmax_{gcm_name}_{period_training}.nc'
     predictand = xr.open_dataset(predictand_filename)
+    lats = torch.tensor(predictand['lat'].values)
+    lat_weights = compute_area_weights(lats).to(device)
     predictand = predictand[[var_target]]
     
     if training_experiment == 'ESD_pseudo_reality':
@@ -190,7 +196,8 @@ def prepare_data(domain="NZ", training_experiment="ESD_pseudo_reality", var_targ
             "x_test_stand_array": x_test_stand_array,
             "dataset_training": dataset_training,
             "dataloader_train": dataloader_train,
-            "test_dataloader": test_dataloader
+            "test_dataloader": test_dataloader,
+            "lat_weights": lat_weights
            }
 
 def train(model: nn.Module, var_target="tasmax", training_experiment='ESD_pseudo_reality', epochs=100, domain='NZ', model_name="model", stochasticity="dropout"):
@@ -225,24 +232,26 @@ def train(model: nn.Module, var_target="tasmax", training_experiment='ESD_pseudo
         is_ucast_model = True
         ckpt_dir = "./models"
         if is_first:
-            final_stage1_ckpt, stage1_history = train_stage1(
+            final_stage1_ckpt, stage1_history, warmup_fraction = train_stage1(
                 model, data["dataloader_train"], data["dataset_training"], device,
-                lat_weights=None, ckpt_dir=ckpt_dir, domain=domain, model_name=model_name
+                lat_weights=data["lat_weights"], ckpt_dir=ckpt_dir, domain=domain, model_name=model_name
             )
+            print(final_stage1_ckpt)
             final_stage2ckpt, prev_domain, stage2_history = train_stage2(
-                model, data["dataloader_train"], data["dataset_training"], device,
-                stage1_ckpt_path=final_stage1_ckpt, lat_weights=None,
+                model, data["dataloader_train"], data["dataset_training"], device, warmup_fraction=warmup_fraction,
+                stage1_ckpt_path=final_stage1_ckpt, lat_weights=data["lat_weights"],
                 ckpt_dir=ckpt_dir, domain=domain, model_name=model_name, stochasticity=stochasticity
             )
             is_first=False
         else:
-            final_stage1_ckpt, stage1_history = train_stage1(
+            final_stage1_ckpt, stage1_history, warmup_fraction = train_stage1(
                 model, data["dataloader_train"], data["dataset_training"], device,
-                lat_weights=None, ckpt_dir=ckpt_dir, domain=domain, model_name=model_name, prev_domain=prev_domain
+                lat_weights=data["lat_weights"], ckpt_dir=ckpt_dir, domain=domain, model_name=model_name, prev_domain=prev_domain
             )
             final_stage2_ckpt, prev_domain, stage2_history = train_stage2(
-                model, data["dataloader_train"], data["dataset_training"], device,
-                stage1_ckpt_path=final_stage1_ckpt, lat_weights=None,
+                model, data["dataloader_train"], data["dataset_training"],
+                device, warmup_fraction=warmup_fraction,
+                stage1_ckpt_path=final_stage1_ckpt, lat_weights=data[lat_weights],
                 ckpt_dir=ckpt_dir, domain=domain, model_name=model_name, stochasticity=stochasticity
             )
         os.makedirs(f"results/{model_name}/training", exist_ok=True)
