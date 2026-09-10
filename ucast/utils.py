@@ -392,9 +392,9 @@ def mosaic_sparse_attn(
     block_size: int,
     softmax_scale: float = None,
 ):
-    #softmax_scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
-    #return MosaicAttnFunction.apply(q, k, v, block_indices, block_size, softmax_scale)
-    return flash_attn_func(q, k, v)
+    softmax_scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+    return MosaicAttnFunction.apply(q, k, v, block_indices, block_size, softmax_scale)
+
 
 
 class MosaicAttention(nn.Module): # nn.Module wrapper: does QKV projection. Generates the gate weights, calls mosaic_attn_func
@@ -478,7 +478,11 @@ def weighted_mae_loss(pred, target, lat_weights=None):
     err = (pred - target).abs()
     if lat_weights is None:
         return err.mean()
-    return (err * lat_weights.view(1, 1, -1, 1)).mean()
+    if lat_weights.dim() == 1:
+        w = lat_weights.view(1, 1, -1, 1)
+    elif lat_weights.dim() == 2:
+        w = lat_weights.view(1, 1, *lat_weights.shape)
+    return (err * w).mean()
 
 
 class EMA:
@@ -549,7 +553,11 @@ def fair_crps_loss(preds, target, lat_weights=None):
         term2 = torch.zeros_like(skill)
     crps = skill - 0.5 * spread  
     if lat_weights is not None:
-        crps = crps * lat_weights.view(1, 1, -1, 1)
+        if lat_weights.dim() == 1:
+            w = lat_weights.view(1, 1, -1, 1)
+        elif lat_weights.dim() == 2:
+            w = lat_weights.view(1, 1, *lat_weights.shape)
+        crps = crps * w
     return crps.mean()
 
 def enable_inference_dropout(model):

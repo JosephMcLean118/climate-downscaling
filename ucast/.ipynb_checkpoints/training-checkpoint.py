@@ -4,24 +4,16 @@ from .utils import handle_fp16, fair_crps_loss, enable_inference_dropout, disabl
 from .muon import Muon, get_muon_momentum, muon_update, zeropower_via_newtonschulz5
 import math
 
-def train_stage1(model, dataloader_train, dataset_training, device, prev_domain="start",
-                  max_epochs=4, lat_weights=None, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model"): 
+def train_stage1(model, dataloader_train, dataset_training, device,
+                  max_epochs=100, lat_weights=None, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model"): 
     """"
     Deterministic pre-training stage.
     Input is normalised, passed through model, weighted-mae is calculated
     """
-
+    print(domain)
     history = []
     model = model.to(device)
-    os.mkdir(f"models/{model_name}/{domain}/stage_one")
-
-    # Load state dict from previous domain
-    if prev_domain != "start":
-        ckpt = torch.load(f"models/{model_name}/{prev_domain}/stage_two/downscale.pt", map_location="cpu", weights_only=False)
-        state_dict = ckpt["model"] if "model" in ckpt else ckpt["state_dict"]
-        model.load_state_dict(state_dict, strict=True)
-        model = model.to(device)
-        
+    os.makedirs(f"models/{model_name}_extended/{domain}/stage_one")
         
     # Target normalization stats
     y_sum, y_sq_sum, y_count = 0.0, 0.0, 0
@@ -95,7 +87,7 @@ def train_stage1(model, dataloader_train, dataset_training, device, prev_domain=
         print(f"[Stage 1] Epoch {epoch+1}/{max_epochs} - Loss: {epoch_loss:.6f}", flush=True)
         history.append(epoch_loss)
 
-        last_ckpt_path = f"{ckpt_dir}/{model_name}/{domain}/stage_one/downscale.pt"
+        last_ckpt_path = f"{ckpt_dir}/{model_name}_extended/{domain}/stage_one/downscale.pt"
         torch.save({"model": model.state_dict(), "ema": ema.shadow,
                    "y_mean": Y_MEAN, "y_std": Y_STD}, last_ckpt_path)
         
@@ -106,23 +98,33 @@ def train_stage1(model, dataloader_train, dataset_training, device, prev_domain=
 def train_stage2(model, dataloader_train, dataset_training, device,
                         stage1_ckpt_path, warmup_fraction, lat_weights=None,
                         max_epochs=8,
-                        num_training_ensemble_members=2, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model", stochasticity="dropout"):
+                        num_training_ensemble_members=2, ckpt_dir="./models", use_muon=True, domain="NZ", model_name="model", stochasticity="dropout", no_stage_one=False):
     """
     Probabilistic fine tuning. We now enable MC dropout and generate an ensemble for predictions.
     CRPS will be used as optimiser. MC dropout is selected by default, however perturbations
     is also an option.
     """
-    # Load in output from stage one
-    ckpt = torch.load(stage1_ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = ckpt["model"] if "model" in ckpt else ckpt["state_dict"]
+    if no_stage_one == False:
+        # Load in output from stage one
+        ckpt = torch.load(stage1_ckpt_path, map_location="cpu", weights_only=False)
+        state_dict = ckpt["model"] if "model" in ckpt else ckpt["state_dict"]
+        model.load_state_dict(state_dict, strict=True)
+        Y_MEAN = ckpt["y_mean"]
+        Y_STD = ckpt["y_std"]
+    else:
+        # Target normalization stats
+        y_sum, y_sq_sum, y_count = 0.0, 0.0, 0
+        for _, batch_y in dataloader_train:
+            y_sum += batch_y.sum().item()
+            y_sq_sum += (batch_y ** 2).sum().item()
+            y_count += batch_y.numel()
+        Y_MEAN = y_sum / y_count
+        Y_STD = (y_sq_sum / y_count - Y_MEAN ** 2) ** 0.5
 
     history = []
-    model.load_state_dict(state_dict, strict=True)
     model = model.to(device)
-    os.mkdir(f"models/{model_name}/{domain}/stage_two")
-    
-    Y_MEAN = ckpt["y_mean"]
-    Y_STD = ckpt["y_std"]
+    os.mkdir(f"models/{model_name}_extended_two/{domain}/stage_two")
+
 
     # Enable dropout for mc ensembling
     model.eval()
@@ -205,7 +207,7 @@ def train_stage2(model, dataloader_train, dataset_training, device,
         epoch_loss /= len(dataset_training)
         print(f"[Stage 2] Epoch {epoch+1}/{max_epochs} - CRPS Loss: {epoch_loss:.6f}", flush=True)
         history.append(epoch_loss)
-        last_ckpt_path = f"{ckpt_dir}/{model_name}/{domain}/stage_two/downscale.pt"
+        last_ckpt_path = f"{ckpt_dir}/{model_name}_extended_two/{domain}/stage_two/downscale_epoch{epoch}.pt"
         torch.save({"model": model.state_dict(), "ema": ema.shadow,
                     "y_mean": Y_MEAN, "y_std": Y_STD},
                    last_ckpt_path)

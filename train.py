@@ -1,12 +1,14 @@
 import os
 import xarray as xr
 import numpy as np
+import time
 import torch
 from torch.utils.data import Dataset, DataLoader
 from ucast.utils import enable_inference_dropout, compute_area_weights 
 import torch.nn as nn
 from pathlib import Path
 import matplotlib.pyplot as plt
+from ucast.ucast import UNetBlock, DhariwalUNet 
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import indices, diagnostics
@@ -102,7 +104,7 @@ def plot_training_history(stage1_history, stage2_history, model_name, domain, sa
 
     path = os.path.join(
         save_dir,
-        f"{model_name}/training/training.png"
+        f"{model_name}/{domain}/training.png"
     )
 
     plt.savefig(path, dpi=200)
@@ -137,19 +139,27 @@ def prepare_data(domain="NZ", training_experiment="ESD_pseudo_reality", var_targ
         gcm_name = 'CNRM-CM5'
     elif (domain == 'NZ') or (domain == 'SA'):
         gcm_name = 'ACCESS-CM2'
-   
+
+
+
     predictor_filename = f'.{DATA_PATH}/{domain}/{domain}_domain/train/{training_experiment}/predictors/{gcm_name}_{period_training}.nc'
     predictor = xr.open_dataset(predictor_filename)
 
     device = ('cuda' if torch.cuda.is_available() else 'cpu')
         
-
-    
-    
     predictand_filename = f'.{DATA_PATH}/{domain}/{domain}_domain/train/{training_experiment}/target/pr_tasmax_{gcm_name}_{period_training}.nc'
     predictand = xr.open_dataset(predictand_filename)
+    
     lats = torch.tensor(predictand['lat'].values)
-    lat_weights = compute_area_weights(lats).to(device)
+    
+    if domain == 'ALPS':
+        lat_weights = compute_area_weights(lats).to(device)
+
+        if lat_weights.dim() == 1:
+            lat_weights = lat_weights.view(lats.shape)
+    else:
+        lat_weights = compute_area_weights(lats).to(device)
+
     predictand = predictand[[var_target]]
     
     if training_experiment == 'ESD_pseudo_reality':
@@ -174,6 +184,10 @@ def prepare_data(domain="NZ", training_experiment="ESD_pseudo_reality", var_targ
         spatial_dims = ('y', 'x')
     elif (domain == 'NZ') or (domain == 'SA'):
         spatial_dims = ('lat', 'lon')
+
+            
+    lat_2d = predictand['lat'].values  # for ALPS
+    print(lat_2d.min(), lat_2d.max())
     
     y_train_stack = y_train.stack(gridpoint=spatial_dims)
     y_test_stack = y_test.stack(gridpoint=spatial_dims)
@@ -200,11 +214,11 @@ def prepare_data(domain="NZ", training_experiment="ESD_pseudo_reality", var_targ
             "lat_weights": lat_weights
            }
 
-def train(model: nn.Module, var_target="tasmax", training_experiment='ESD_pseudo_reality', epochs=100, domain='NZ', model_name="model", stochasticity="dropout"):
+def train(var_target="tasmax", training_experiment='ESD_pseudo_reality', epochs=20, domain='NZ', model_name="model", stochasticity="dropout", block_sparse_attention=False, base="convolutional", stage="ALL"):
     """
-    Train given downscaling model and save state dictionary
+    Train downscaling model
     
-    Input: downscaling model
+    Input: model parameters
     Output: state dictionary 
     """    
 
@@ -225,35 +239,38 @@ def train(model: nn.Module, var_target="tasmax", training_experiment='ESD_pseudo
     torch.cuda.reset_peak_memory_stats()
     
     for domain, data in data_all_domains.items():
-        os.mkdir(f"models/{model_name}/{domain}")
+        model = DhariwalUNet(in_channels=15, out_channels=1, block_sparse_attention=block_sparse_attention, base="convolutional")
+        os.makedirs(f"models/{model_name}_extended_two/{domain}")
         device = ('cuda' if torch.cuda.is_available() else 'cpu')
         model = model.to(device)
-        
-        is_ucast_model = True
+
         ckpt_dir = "./models"
-        if is_first:
+        start = time.perf_counter()
+        if stage == "ALL":
             final_stage1_ckpt, stage1_history, warmup_fraction = train_stage1(
                 model, data["dataloader_train"], data["dataset_training"], device,
-                lat_weights=data["lat_weights"], ckpt_dir=ckpt_dir, domain=domain, model_name=model_name
+                lat_weights=data["lat_weights"], ckpt_dir=ckpt_dir, domain=domain, model_name=model_name, max_epochs=100
             )
-            print(final_stage1_ckpt)
+            
             final_stage2ckpt, prev_domain, stage2_history = train_stage2(
                 model, data["dataloader_train"], data["dataset_training"], device, warmup_fraction=warmup_fraction,
                 stage1_ckpt_path=final_stage1_ckpt, lat_weights=data["lat_weights"],
                 ckpt_dir=ckpt_dir, domain=domain, model_name=model_name, stochasticity=stochasticity
             )
-            is_first=False
-        else:
+        elif stage == "ONE":
             final_stage1_ckpt, stage1_history, warmup_fraction = train_stage1(
                 model, data["dataloader_train"], data["dataset_training"], device,
-                lat_weights=data["lat_weights"], ckpt_dir=ckpt_dir, domain=domain, model_name=model_name, prev_domain=prev_domain
+                lat_weights=data["lat_weights"], ckpt_dir=ckpt_dir, domain=domain, model_name=model_name, max_epochs=100
             )
-            final_stage2_ckpt, prev_domain, stage2_history = train_stage2(
-                model, data["dataloader_train"], data["dataset_training"],
-                device, warmup_fraction=warmup_fraction,
-                stage1_ckpt_path=final_stage1_ckpt, lat_weights=data[lat_weights],
-                ckpt_dir=ckpt_dir, domain=domain, model_name=model_name, stochasticity=stochasticity
+        elif stage == "TWO":
+            final_stage2ckpt, prev_domain, stage2_history = train_stage2(
+                model, data["dataloader_train"], data["dataset_training"], device, warmup_fraction=0.09375,
+                stage1_ckpt_path="models/cnn_mcdropout/NZ/stage_one/downscale.pt", lat_weights=data["lat_weights"],
+                ckpt_dir=ckpt_dir, domain=domain, model_name=model_name, stochasticity=stochasticity, no_stage_one=True, max_epochs=20
             )
-        os.makedirs(f"results/{model_name}/training", exist_ok=True)
-        plot_training_history(stage1_history, stage2_history, model_name=model_name, domain=domain)
+        end = time.perf_counter()
+        training_time = end - start
+        print(f"{training_time:.6f}")
+        os.makedirs(f"results/{model_name}/{domain}", exist_ok=True)
+        #plot_training_history(stage1_history, stage2_history, model_name=model_name, domain=domain)
         

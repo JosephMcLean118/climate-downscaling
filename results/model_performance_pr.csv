@@ -1,0 +1,6 @@
+model,paramaters,stochasticity,attention,RMSE,SDII,Rx1day,RALSD,LHD,Average Inference Time (ms),Inference Memory Usage (GB),P98_Bias
+mcdropout_pr,43756428,mcdropout,dense,5.6346,7.1697,32.3851,54.9672,0.5171,16.0043,0.7958,-6.2664
+mcdropout_blocksparse_pr,43756428,mcdropout,blocksparse,5.5689,7.1238,31.8859,50.7725,0.5054,18.0619,0.7969,-6.1898
+perturbation_pr,43756428,perturbation,dense,5.7869,6.7709,42.0762,135.1315,0.8811,20.1725,0.9935,-9.6528
+perturbation_blocksparse_pr,43756428,perturbation,blocksparse,5.7947,6.3664,40.9338,151.3552,1.1073,22.6744,0.9946,-10.8332
+UNetProbTWO,43756428,mcdropout,dense,287.4016,290.4424,230.0539,117.1054,287.2098,15.5644,0.9662,272.0761

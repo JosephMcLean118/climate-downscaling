@@ -107,10 +107,6 @@ class UNetBlock(nn.Module):
 class TransformerUNetBlock(nn.Module):
     """
     Transormer style block to be used in UNet in place of convolutional style blocks.
-    
-    Rather than have attention at certain layers and use convolutions for feature
-    extraction and resampling, use self attention at all layers and MLP based feature
-    processing.
     """
     def __init__(
         self,
@@ -118,6 +114,7 @@ class TransformerUNetBlock(nn.Module):
         out_channels,
         up=False,
         down=False,
+        block_sparse_attention=False,
         num_heads=None,
         dropout=0.1,
         mlp_ratio=4.0,
@@ -129,6 +126,7 @@ class TransformerUNetBlock(nn.Module):
         self.out_channels = out_channels
         self.up = up
         self.down = down
+        self.block_sparse_attention=block_sparse_attention
         self.noise_dim=64
         self.swiglu = cSwiGLU(
             dim=out_channels,
@@ -189,8 +187,6 @@ class TransformerUNetBlock(nn.Module):
         # Image to tokens
         x = rearrange(x, "b c h w -> b (h w) c")
         residual = rearrange(residual, "b c h w -> b (h w) c")
-        sparse_block_size = min(16, tokens)
-        nb = tokens // sparse_block_size
 
         # Input projection
         x = self.input_proj(x)
@@ -198,18 +194,27 @@ class TransformerUNetBlock(nn.Module):
         # Residual projection
         residual = self.skip_proj(residual)
 
+        # Perturbation
+        if z is not None and H < 128:
+            x = x + self.swiglu(x, z)
+
         # Self attention
         x_norm = self.norm1(x)
         qkv = self.qkv(x_norm)
         q, k, v = qkv.chunk(3, dim=-1)
-        q = rearrange(q, "b n (h d) -> b n h d", h=nh)
-        k = rearrange(k, "b n (h d) -> b n h d", h=nh)
-        v = rearrange(v, "b n (h d) -> b n h d", h=nh)
+        q, k, v = [rearrange(x, "b n (h d) -> b n h d", h=nh) for x in (q, k, v)]
 
-        # Block Sparse Attention
-        out = run_mosaic_attn(q=q, k=k, v=v, x=x_norm, to_strategy=self.to_strategy, num_heads=nh, 
-                    tokens=tokens, rearrange_pattern="b n (s h) -> s b n h")
-
+        if self.block_sparse_attention and tokens>=16:
+            # Block Sparse Attention
+            out = run_mosaic_attn(q=q, k=k, v=v, x=x_norm, to_strategy=self.to_strategy, num_heads=nh, 
+                        tokens=tokens, rearrange_pattern="b n (s h) -> s b n h")
+        else:
+            # Dense attention
+            q, k, v = [rearrange(x, "b n h d -> (b h) d n", h=nh) for x in (q, k, v)]
+            attn_w = AttentionOp.apply(q, k)
+            a = torch.einsum("nqk,nck->ncq", attn_w, v)
+            out = rearrange(a, "(b h) d n -> b n h d", b=B, h=nh)
+     
         # Heads to channels
         out = rearrange(out, "b n h d -> b n (h d)")
         out = self.proj(out)
@@ -235,7 +240,7 @@ class DhariwalUNet(nn.Module):
         model_channels=64,
         channel_mult=(1, 2, 3, 4),
         num_blocks=3,
-        attn_levels=(2, 3),
+        attn_levels=(0, 1),
         block_sparse_attention=False,
         base="convolutional", 
         channels_per_head=64,
